@@ -324,3 +324,292 @@ matplot(t(S_mat[1:n_show, ]), type = "l", lty = 1, col = 1:n_show,
         main = sprintf("First %d simulated price paths (sample)", n_show),
         xlab = "monitoring index (1..N)", ylab = "S_t")
 legend("topright", legend = paste0("path", 1:n_show), col = 1:n_show, lty = 1, cex = 0.7)
+
+#------
+# We now do a quick check to compare our results to exact-log discretization in closed form per step
+#The log-update we have is exact for GBM, so the exact simulation is in the results above
+#-------
+
+cat("\n Using the log-update (S_{t+dt}= S_t * exp(...)) is exact for GBM increments.\n")
+cat("If you decided to use the standard Euler on S (S_{t+dt} = S_t + r*S_t*dt + sigma*S_t*sqrt(dt)*Z)\n",
+    " you would get a slightly diffferent (less stable) result for coarse dt.\n")
+
+#Finally, we will save our results
+
+saveRDS(list(price = price_mc, ci = c(ci_lower, ci_upper),
+        params = list(S0 = S0, r=r, sigma=sigma, T=T, N=N, M=M),
+        summary = list(mean_payoff=mean_payoff, sd_payoff=sd_payoff)),
+        file = "asian_mc_result.rds")
+cat("\nResults saved to 'asian_mc_result.rds'\n")        
+
+
+#--------------------------------#
+
+#------ Part b: Control variate using geometric-average floating strike ------#
+
+#--------------------------------#
+
+#We first compute the geometric average G for each path
+
+logS_mat <- log(S_mat)
+G_vec <- exp(rowMeans(logS_mat[, 2:(N+1)]))
+Y_payoff <- pmax(S_T -G_vec, 0)
+
+#We now compute the analytic E[Y] for Y= max(S_T - G, 0)
+
+muY_geo_float <- function(S0, r, sigma, T, N){
+  #monitoring times
+  t_i <- (1:N) * (T/N)
+  #the moments for ln(S_T) and ln(G)
+  muX <- log(S0) + (r - 0.5 * sigma^2) *T #E[ln (S_T)]
+  varX <- sigma^2 * T
+  muZ <- log(S0) + (r- 0.5*sigma^2) * mean(t_i)
+  #for var(ln G) we need two things: sum(i,j) and min(t_i, t_j)
+  tij <- outer(t_i, t_i, pmin)
+  varZ <- sigma^2 * (1/(N^2)) * sum(tij)
+  covXZ <- sigma^2 * (1/N) * sum(t_i)
+  #We clean up to avoid degenerate cases
+  if (varZ <= 0 || varX <= 0) {
+    stop("Degenerate variance in muY calculation (varZ or varX <= 0).")
+  }
+  #correlation
+  rho <- covXZ / sqrt(varX * varZ)
+  
+  # E1= E[e^{X} 1_{X > Z}]
+  a <- 1 - covXZ/varX
+  b <- (covXZ/varX) * muX - muZ
+  s <- sqrt(varZ * (1- rho^2))
+  #we add a step to be safe
+  if (s <= 0) s<- sqrt(.Machine$double.eps)
+  alpha <- a/s
+  beta <- b/s
+  arg1 <- ( alpha * (muX + varX) + beta) / sqrt(1+ alpha^2 * varX)
+  E1 <- exp(muX + 0.5 * varX) * pnorm(arg1)
+  
+  # E2 = E[e*Z 1_{X > z}]
+  a2 <- (covXZ / varZ) - 1
+  b2 <- muX - (covXZ/varZ) * muZ
+  s2 <- sqrt(varX * (1-rho^2))
+  if (s2 <= 0 ) s2<- sqrt(.Machine$double.eps)
+  alpha2 <- a2/s2
+  beta2 <-  b2/s2
+  arg2 <- ( alpha2 * (muZ + varZ) + beta2) / sqrt(1 + alpha2^2 * varZ)
+  E2 <- exp(muZ + 0.5* varZ) * pnorm(arg2)
+  
+  muY <- E1 - E2
+  return(list(muY = muY, 
+              details  = list(muX = muX, varX=varX, muZ = muZ, varZ = varZ,
+                              covXZ = covXZ, rho= rho, E1 = E1, E2 = E2,
+                              arg1 = arg1, arg2 = arg2)))
+}
+
+#compute analytic mu_Y for current parameters 
+muY_info <- muY_geo_float(S0 = S0, r=r, sigma = sigma, T = T, N = N)
+muY <- muY_info$muY
+
+cat("\nPart (b) - control variate setup:\n")
+cat(sprintf("Analytic mu_Y (undiscounted) = %.8f\n", muY))
+
+# empirical theta estimate
+X_payoff <- payoff
+if (var(Y_payoff) <= 0) {
+  theta_hat <- 0
+  warning("Var(Y) is zero or numerically negligible; setting theta_hat = 0.")
+} else {
+  theta_hat <- cov(X_payoff, Y_payoff) / var(Y_payoff)
+}
+
+cat(sprintf("Empirical theta_hat = %.8f\n", theta_hat))
+
+#Adjusted estimator and discounted CV price
+Z_adj <- X_payoff + theta_hat * (muY - Y_payoff)
+disc_Z_adj <- discount_factor * Z_adj
+
+price_CV <- mean(disc_Z_adj)
+sd_CV <- sd(disc_Z_adj)
+se_CV <- sd_CV / sqrt(M)
+ci_CV <- price_CV + c(-1.96,1.96) * se_CV
+
+cat(sprintf("Control variate price (discounted mean) = %.8f\n", price_CV))
+cat(sprintf("95%% CI (CV) = [%.8f, %.8f]\n", ci_CV[1], ci_CV[2]))
+cat(sprintf("sd(disc adj payoff) = %.8f, SE = %.8f\n", sd_CV, se_CV))
+
+
+#----------------------------------#
+
+#----- Part c: Compare plain MC vs control variate ------#
+
+#----------------------------------#
+price_plain <- price_mc_alt
+sd_plain <- sd_disc
+se_plain <- se_disc
+ci_plain <- c(ci_disc_lower, ci_disc_upper)
+
+cat("\nPart (c) - comparison:\n")
+cat(sprintf("Plain Monte Carlo price = %.8f\n", price_plain))
+cat(sprintf("95%% CI (Plain) = [%.8f, %.8f]\n", ci_plain[1], ci_plain[2]))
+cat(sprintf("Control variate price = %.8f\n", price_CV))
+cat(sprintf("95%% CI (CV) = [%.8f, %.8f]\n", ci_CV[1], ci_CV[2]))
+
+#We notice that the Control Variates method produces a much tighter Confidence interval
+
+#We calculate the percentage variance reduction using undiscounted payoffs
+
+var_plain_undisc <- var(X_payoff)
+var_cv_undisc <- var(Z_adj)
+pct_var_reduction <- 100 * (var_plain_undisc - var_cv_undisc) / var_plain_undisc
+
+cat(sprintf("Variance plain (undiscounted) - %.8f\n", var_plain_undisc))
+cat(sprintf("Variance CV (undiscounted) = %.8f\n", var_cv_undisc))
+cat(sprintf("Percentage varince reduction (undiscounted) = %.2f %%\n", pct_var_reduction))
+
+#We now show the narrowness of CI
+
+ci_width_plain <- diff(ci_plain)
+ci_width_cv <- diff(ci_CV)
+cat(sprintf("Ci width plain = %.8f, CI width CV =%.8f (reduction %.2f%%)\n",
+            ci_width_plain, ci_width_cv, 100 * (ci_width_plain - ci_width_cv) / ci_width_plain))
+
+#We overlay the plot of densities
+
+df_plot <- data.frame(plain = discounted_payoffs, cv = disc_Z_adj)
+df_long <- data.frame(value = c(df_plot$plain, df_plot$cv),
+                      method = rep(c("Plain", "ControlVar"), each = length(df_plot$plain)))
+ggplot(df_long, aes(x = value, color = method, fill = method)) +
+  geom_density(alpha = 0.15) +
+  labs(title = "Discounted payoff densities: Plain vs Control Variate",
+        x= "Discounted payoff", y="Density") +
+  theme_minimal()
+
+#-----------------------------------------------#
+
+#Part d: Experiments
+
+#-----------------------------------------------#
+
+#CI half-width vs M
+
+M_seq <- c(500, 1000, 2000, 5000, 10000, 20000, 50000, M)
+df_CI <- data.frame(M = integer(), method = character(), halfwidth = numeric(),
+                    price = numeric(), stringsAsFactors = FALSE)
+
+for (m in M_seq) {
+  Xm <- payoff[1:m]
+  Gm <- G_vec[1:m]
+  Ym <- pmax(S_T[1:m] - Gm, 0)
+  disc_Xm <- discount_factor* Xm
+  hw_plain_m <- 1.96 * sd(disc_Xm) / sqrt(m)
+  price_plain_m <- mean(disc_Xm)
+  df_CI <- rbind(df_CI, data.frame(M=m, method = "Plain", halfwidth = hw_plain_m,
+                                   price = price_plain_m))
+  if (var(Ym) <= 0){
+    theta_m <- 0
+  } else {
+    theta_m <- cov(Xm, Ym) / var(Ym)
+  }
+  Zm <- Xm + theta_m * (muY - Ym)
+  disc_Zm <- discount_factor * Xm
+}
+
+ggplot(df_CI, aes(x = M, y= halfwidth, color = method)) +
+  geom_line() + geom_point() + scale_x_log10() + scale_y_log10()+
+  labs(title = "95% CI half-width vs M (Plain vs Control Variate)", 
+       x = "Number of simulations M (log schale)", y= "CI half-width (log scale)")+
+  theme_minimal() -> p_ci_vs_M
+print(p_ci_vs_M)
+
+#We can tell from our output that increasing M consistently decrease the width of the CI.
+#This results in a consistently increasing accuracy at a proportionally heavy cost of computing power.
+
+
+# CV efficiency depending on N and sigma
+#We start with multiple N with a moderate M_rep for each
+
+N_values <- c(10,50,100)
+sigma_values <- c(0.1,0.2,0.4)
+M_rep <- 20000
+set.seed(2025)
+
+exp_results <- data.frame(N= integer(), sigma = numeric(), method = character(), 
+                          price = numeric(), sd_disc = numeric(), ci_halfwidth = numeric(),
+                          pct_var_reduction = numeric(), stringsAsFactors = FALSE)
+
+simulate_paths <- function(S0, r, sigma, T, N, M, seed= NULL){
+  if (!is.null(seed)) set.seed(seed)
+  dt <- T/N
+  sqrt_dt <- sqrt(dt)
+  Z <- matrix(rnorm(M *N), nrow = M, ncol = N)
+  logS <- matrix(0, nrow= M, ncol = N+1)
+  logS[, 1] <- log(S0)
+  for (i in 1:N) {
+    logS[, i+1] <- logS[, i] + (r-0.5 *sigma^2) *dt + sigma * sqrt_dt * Z[,i]
+  }
+  S <- exp(logS)
+  S_T_sim <- S[, N+1]
+  S_bar_arith_sim <- rowMeans(S[, 2:(N+1)])
+  S_bar_geom_sim <- exp(rowMeans(logS[, 2:(N+1)]))
+  Xs <- pmax(S_T_sim - S_bar_arith_sim, 0)
+  Ys <- pmax(S_T_sim - S_bar_geom_sim, 0)
+  return(list(X=Xs, Y=Ys, S_T = S_T_sim, S_arith = S_bar_arith_sim, S_geom = S_bar_geom_sim))
+}
+
+cat("\nPart(d) - exploring dependence on N and sigma (M_rep =", M_rep, ")\n")
+for (Nv in N_values) {
+  for (sigv in sigma_values){
+    cat(sprintf("Simulating N=%d, sigma=%.2f ...\n", Nv, sigv))
+    sim <- simulate_paths(S0 = S0, r=r, sigma = sigv, T=T, N=Nv, M=M_rep, seed = NULL)
+    Xv <- sim$X
+    Yv <- sim$Y
+    disc_Xv <- discount_factor * Xv
+    price_plain_v <- mean(disc_Xv)
+    sd_plain_v <- sd(disc_Xv)
+    hw_plain_v <- 1.96 * sd_plain_v / sqrt(M_rep)
+    muYv <- muY_geo_float(S0 = S0, r=r, sigma = sigv, T=T, N=Nv)$muY
+    if (var(Yv) <= 0) theta_v <- 0 else theta_v <- cov(Xv, Yv) / var(Yv)
+    Zv <-  Xv + theta_v * (muYv -Yv)
+    disc_Zv <- discount_factor * Zv
+    price_cv_v <- mean(disc_Zv)
+    sd_cv_v <- sd(disc_Zv)
+    hw_cv_v <- 1.96 * sd_cv_v / sqrt(M_rep)
+    pct_red_v <- 100 * (var(Xv) - var(Zv)) /var(Xv)
+    exp_results <- rbind(exp_results,
+                         data.frame(N = Nv, sigma = sigv, method = "Plain",
+                                    price = price_plain_v, sd_disc = sd_plain_v, ci_halfwidth = hw_plain_v,
+                                    pct_var_reduction = NA),
+                         data.frame(N = Nv, sigma = sigv, method = "ControlVar",
+                                    price = price_cv_v, sd_disc = sd_cv_v, ci_halfwidth = hw_cv_v,
+                                    pct_var_reduction = pct_red_v))
+    cat(sprintf(" -> pct variance reduction (CV) = %.2f %%\n", pct_red_v))
+  }
+}
+
+print(exp_results)
+
+df_red <- subset(exp_results, method == "ControlVar")
+ggplot(df_red, aes(x= factor(sigma), y = pct_var_reduction, group = factor(N), color = factor(N))) +
+  geom_point() + geom_line(aes(group = factor(N))) +
+  labs(title = "Percent variance reduction by Control Variate",
+       x = expression(sigma), y= "Variance reduction(%)", color = "N (monitor points)") +
+  theme_minimal() -> p_red 
+print(p_red)
+
+#We notice that the number of time steps N does not seem to create a big difference,
+#while on the other hand, and increasing sigma reduces the Variance reduction percentage.
+
+#Final summary prints
+cat("\nSummary (final):\n")
+cat(sprintf("Plain Monte Carlo price: %.8f (95%% CI width = %.8f)\n", price_plain, ci_width_plain))
+cat(sprintf("Control variate price: %.8f (95%% CI width = %.8f)\n", price_CV, ci_width_cv))
+cat(sprintf("Emprical theta_hat = %.8f, analytic mu_Y (undiscounted) = %.8f\n", theta_hat, muY))
+cat(sprintf("Overall percentage variance reduction (using entire sample) = %.2f %%\n", pct_var_reduction))
+cat("Experiment table (N, sigma, method, price, sd_disc, ci_halfwidth, pct_var_reduction):\n")
+print(exp_results)
+
+
+#We now decide to save the outputs
+saveRDS(list(plain_price = price_plain, plain_CI = ci_plain,
+             cv_price = price_CV, cv_CI = ci_CV,
+             theta_hat = theta_hat, muY = muY,
+             df_CI = df_CI, exp_results = exp_results),
+        file = "asian_mc_controls_results.rds")
+cat("\nSaved results to 'asian_mc_controls_results.rds'\n")
